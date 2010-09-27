@@ -5,41 +5,43 @@ import sys
 class BusPirate:
     def __init__ (self, f = "/dev/bus_pirate"):
         self.port = serial.Serial(port = f, baudrate = 115200, timeout = 0.01)
+        self.reset()
 
-    def write (self, data):
-        self.port.write(data)
-    def read (self, count):
-        return self.port.read(count)
-    def flush (self):
-        self.port.flush()
+    def reset (self):
+        self.port.write(bytearray([0x0F]))
+        while self.port.read(5) != "BBIO1":
+            self.port.write(bytearray([0x00]))
+            time.sleep(0.01)
+        self.port.write(bytearray([0x05]))
+        if self.port.read(4) != "RAW1":
+            print("error initializing bus pirate")
+            sys.exit(1)
+        self.port.write(bytearray([0x63,0x88]))
+        self.port.read(9999)
 
-# reset the bus pirate into raw binary mode suitable for SWD
-def bpReset(pirate):
-    pirate.write("\x0F")
-    while pirate.read(5) != "BBIO1":
-        pirate.write("\x00")
-        time.sleep(0.01)
+    def send (self, data):
+        for byte in data:
+            self.port.write(bytearray([0x10,byte]))
+            self.port.read(2)
 
-    # set it to raw binary mode and verify
-    pirate.write("\x05")
-    if pirate.read(4) != "RAW1":
-        print("error initializing bus pirate to raw binary mode")
-        sys.exit(1)
+    def bits (self, count):
+        self.port.write(bytearray([0x07] * count))
+        return [self.port.read(1) for x in range(count)]
 
-    # set the speed and various output mode flags
-    pirate.write("\x63\x88")
+    def bytes (self, count):
+        self.port.write(bytearray([0x06] * count))
+        return bytearray([self.port.read(1) for x in range(count)])
 
 # put the STM32 chip into SWD mode by sending the correct bitstream
 def swdEntry(pirate):
-    pirate.write("\x17\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF")
-    pirate.write("\x11\x79\xE7")
+    pirate.send([0xFF] * 8)
+    pirate.send([0x79,0xE7])
     swdReset(pirate)
 
 # send a bit pattern which fixes any SWD framing issues
 def swdReset(pirate):
-    pirate.write("\x17\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF")
-    pirate.write("\x17\x00\x00\x00\x00\x00\x00\x00\x00")
-    pirate.flush()
+    pirate.send([0xFF] * 8)
+    pirate.send([0x00] * 8)
 
 def calcOpcode(ap=False, register=0x00, read=True):
     def bitCount(int_type):
@@ -57,30 +59,20 @@ def calcOpcode(ap=False, register=0x00, read=True):
     return opcode
 
 def swdRead(pirate, ap=False, register=0x00):
-    opcode = calcOpcode(ap, register, True)
-    # discard any buffered data
-    pirate.read(9999)
-    # write the opcode bit
-    pirate.write(chr(0x10)+chr(opcode))
-    pirate.read(2)
-    # read the ACK
-    pirate.write("\x07\x07\x07")
-    ack = pirate.read(3)
-    # read the data
-    pirate.write("\x06\x06\x06\x06")
-    data = pirate.read(4)
-    # other bits
-    pirate.write("\x07\x07\x07")
-    pirate.read(3)
+    pirate.send([calcOpcode(ap, register, True)])
+    ack = pirate.bits(3)
+    data = pirate.bytes(4)
+    extra = pirate.bits(3)
     return data
 
 def main():
     pirate = BusPirate("/dev/ttyUSB0")
-    bpReset(pirate)
     swdEntry(pirate)
     swdReset(pirate)
-    print(swdRead(pirate).encode("hex"))
-    print(swdRead(pirate, register=0x00).encode("hex"))
+    print(hexEncode(swdRead(pirate, register=0x00)))
+
+def hexEncode (ba):
+    return ''.join(["%02X " % b for b in ba]).strip()
 
 if __name__ == "__main__":
     main()
