@@ -19,18 +19,18 @@ class BusPirate:
         self.port.write(bytearray([0x63,0x88]))
         self.port.read(9999)
 
-    def send (self, data):
-        for byte in data:
-            self.port.write(bytearray([0x10,byte]))
-            self.port.read(2)
-
-    def bits (self, count):
+    def readBits (self, count):
         self.port.write(bytearray([0x07] * count))
         return [ord(self.port.read(1)) for x in range(count)]
 
-    def bytes (self, count):
+    def readBytes (self, count):
         self.port.write(bytearray([0x06] * count))
         return [ord(self.port.read(1)) for x in range(count)]
+
+    def sendBytes (self, data):
+        for byte in data:
+            self.port.write(bytearray([0x10,byte]))
+            self.port.read(2)
 
 def bitCount(int_type):
     count = 0
@@ -54,100 +54,176 @@ def calcOpcode (ap=False, register=0x00, read=True):
     opcode = opcode | 0x81
     return opcode
 
-class SWDP:
-    def __init__ (self, f = "/dev/bus_pirate"):
-        self.pirate = BusPirate(f)
-        self.pirate.send([0xFF] * 8)
-        self.pirate.send([0x79,0xE7])
+class SWD:
+    def __init__ (self, port):
+        self.port = port
+        self.port.sendBytes([0xFF] * 8)
+        self.port.sendBytes([0x79, 0xE7])
         self.resync()
 
     def resync (self):
-        self.pirate.send([0xFF] * 8)
-        self.pirate.send([0x00] * 8)
+        self.port.sendBytes([0xFF] * 8)
+        self.port.sendBytes([0x00] * 8)
 
-    def read (self, ap = False, register = 0b00):
+    def read (self, ap, register):
         # transmit the opcode
-        self.pirate.send([calcOpcode(ap, register, True)])
+        self.port.sendBytes([calcOpcode(ap, register, True)])
         # check the response
-        ack = self.pirate.bits(3)
+        ack = self.port.readBits(3)
         if ack[0:3] != [1,0,0]:
             print("error in SWD stream")
             print(ack[0:3])
             sys.exit(1)
         # read the next 4 bytes
-        data = [reverseBits(b) for b in self.pirate.bytes(4)]
+        data = [reverseBits(b) for b in self.port.readBytes(4)]
         data.reverse()
-        extra = self.pirate.bits(3)
+        extra = self.port.readBits(3)
         # check the parity
         if sum([bitCount(x) for x in data[0:4]]) % 2 != extra[0]:
             print("parity error")
         # required miniminum idle clocking is 8 bits
-        self.pirate.send(bytearray([0x00]))
+        self.port.sendBytes(bytearray([0x00]))
         # finally return the data
-        return data
+        return (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3]
 
-    def write (self, data, ap = False, register = 0b00):
+    def write (self, ap, register, data):
         # transmit the opcode
-        self.pirate.send([calcOpcode(ap, register, False)])
+        self.port.sendBytes([calcOpcode(ap, register, False)])
         # check the response
-        ack = self.pirate.bits(5)
+        ack = self.port.readBits(5)
         if ack[0:3] != [1,0,0]:
             print("error in SWD stream")
             print(ack[0:3])
             sys.exit(1)
         # output the data
-        payload = [reverseBits(x) for x in data[0:4]]
-        payload.reverse()
-        self.pirate.send(payload)
-        # output the parity bit
+        payload = [0x00, 0x00, 0x00, 0x00]
+        payload[0] = reverseBits((data >>  0) & 0xFF)
+        payload[1] = reverseBits((data >>  8) & 0xFF)
+        payload[2] = reverseBits((data >> 16) & 0xFF)
+        payload[3] = reverseBits((data >> 24) & 0xFF)
+        self.port.sendBytes(payload)
+        # output the parity bit and idle clocking
         if sum([bitCount(x) for x in payload]) % 2:
-            self.pirate.port.write(bytearray([0x0D, 0x09]))
-            self.pirate.port.read(2)
+            self.port.sendBytes([0x80, 0x00])
         else:
-            self.pirate.port.write(bytearray([0x0C, 0x09]))
-            self.pirate.port.read(2)
-        # required minimum idle clocking is 8 bits
-        self.pirate.send(bytearray([0x00]))
+            self.port.sendBytes([0x00, 0x00])
 
-#class SWAP:
-#    def __init__ (self, swdp, apsel = 0x00):
-#        self.swdp = swdp
+class DebugPort:
+    def __init__ (self, swd):
+        self.swd = swd
+        # read the IDCODE
+        if self.idcode() != 0x1BA01477:
+            print "warning: unexpected idcode"
+        # power shit up
+        self.swd.write(False, 1, 0x54000000)
+        if (self.status() >> 24) != 0xF4:
+            print "error powering up system"
+            sys.exit(1)
+        # get the SELECT register to a known state
+        self.select(0,0)
+        self.curAP = 0
+        self.curBank = 0
+
+    def idcode (self):
+        return self.swd.read(False, 0)
+
+    def abort (self, orunerr, wdataerr, stickyerr, stickycmp, dap):
+        value = 0x00000000
+        value = value | (0x10 if orunerr else 0x00)
+        value = value | (0x08 if wdataerr else 0x00)
+        value = value | (0x04 if stickyerr else 0x00)
+        value = value | (0x02 if stickycmp else 0x00)
+        value = value | (0x01 if dap else 0x00)
+        self.swd.write(False, 0, value)
+
+    def status (self):
+        return self.swd.read(False, 1)
+
+    def control (self, trnCount = 0, trnMode = 0, maskLane = 0, orunDetect = 0):
+        value = 0x54000000
+        value = value | ((trnCount & 0xFFF) << 12)
+        value = value | ((maskLane & 0x00F) << 8)
+        value = value | ((trnMode  & 0x003) << 2)
+        value = value | (0x1 if orunDetect else 0x0)
+        self.swd.write(False, 1, value)
+
+    def select (self, apsel, apbank):
+        value = 0x00000000
+        value = value | ((apsel  & 0xFF) << 24)
+        value = value | ((apbank & 0x0F) <<  4)
+        self.swd.write(False, 2, value)
+
+    def readRB (self):
+        return self.swd.read(False, 3)
+
+    def readAP (self, apsel, address):
+        adrBank = (address >> 4) & 0xF
+        adrReg  = (address >> 2) & 0x3
+        if apsel != self.curAP or adrBank != self.curBank:
+            self.select(apsel, adrBank)
+            self.curAP = apsel
+            self.curBank = adrBank
+        return self.swd.read(True, adrReg)
+
+    def writeAP (self, apsel, address, data):
+        adrBank = (address >> 4) & 0xF
+        adrReg  = (address >> 2) & 0x3
+        if apsel != self.curAP or adrBank != self.curBank:
+            self.select(apsel, adrBank)
+            self.curAP = apsel
+            self.curBank = adrBank
+        self.swd.write(True, adrReg, data)
 
 def main():
-    swdp = SWDP("/dev/ttyUSB0")
-    swdp.resync()
+    busPirate = BusPirate("/dev/ttyUSB0")
+    debugPort = DebugPort(SWD(busPirate))
 
-    # read from the DP.IDCODE register
-    print hexEncode( swdp.read(ap = False, register = 0b00) )
+    print hex( debugPort.idcode() )
 
-    rID     = 0
-    rMulti  = 1
-    rSelect = 2
+    debugPort.readAP(0, 0xFC)
+    print hex( debugPort.readRB() )
 
-    # select Wire Control Register and set properly
-    swdp.write([0x00,0x00,0x00,0x01], ap = False, register = rSelect)
-    swdp.write([0x00,0x00,0x00,0x40], ap = False, register = rMulti)
+    debugPort.readAP(0, 0x00)
+    csw = debugPort.readRB()
+    debugPort.writeAP(0, 0x00, csw | 0x12)
+    debugPort.readAP(0, 0x00)
+    print hex( csw                )
+    print hex( debugPort.readRB() )
 
-    # select Status Register and power shit up
-    swdp.write([0x00,0x00,0x00,0x00], ap = False, register = rSelect)
+    debugPort.writeAP(0, 0x04, 0xE0042000)
+    debugPort.readAP(0,0x0C)
+    print hex(debugPort.readRB())
 
-    # CSYSPOWERUPREQ | CDBGPWRUPREQ
-    swdp.write([0x54,0x00,0x00,0x00], ap = False, register = rMulti)
-    if swdp.read(ap = False, register = rMulti)[0] != 0xF4:
-        print "error powering up system"
-        sys.exit(1)
+    debugPort.writeAP(0, 0x04, 0x08000000)
+    for off in range(1024):
+        debugPort.readAP(0,0x04)
+        adr = debugPort.readRB()
+        debugPort.readAP(0,0x0C)
+        val = debugPort.readRB()
+        print "%08X: %08X" % (adr, val)
 
-    # try to write to AP.TAP
-    swdp.write([0x00, 0x00, 0x00, 0x00], ap = False, register = rSelect)
-    swdp.write([0x12, 0x23, 0x34, 0x45], ap = True,  register = 1)
-    print hexEncode( swdp.read(ap = True,  register = 1) )
-    print hexEncode( swdp.read(ap = False, register = 3) )
+#    debugPort.readAP(0, 0x00)
+#    debugPort.writeAP(0, 0x04, 0x12345678)
+#    print hex( debugPort.readAP(0, 0x04) )
+#    print hex( debugPort.readAP(0, 0x08) )
+#    print hex( debugPort.readAP(0, 0x04) )
+#    print hex( debugPort.readRB() )
 
-    # try to read AP zero IDR
-    swdp.write([0x00, 0x00, 0x00, 0xF0], ap = False, register = 2)
-    print hexEncode( swdp.read(ap = True,  register = 3) )
-    print hexEncode( swdp.read(ap = True,  register = 3) )
-    print hexEncode( swdp.read(ap = False, register = 3) )
+#    rID     = 0
+#    rMulti  = 1
+#    rSelect = 2
+#
+#    # try to write to AP.TAP
+#    swdp.write([0x00, 0x00, 0x00, 0x00], ap = False, register = rSelect)
+#    swdp.write([0x12, 0x23, 0x34, 0x45], ap = True,  register = 1)
+#    print hexEncode( swdp.read(ap = True,  register = 1) )
+#    print hexEncode( swdp.read(ap = False, register = 3) )
+#
+#    # try to read AP zero IDR
+#    swdp.write([0x00, 0x00, 0x00, 0xF0], ap = False, register = 2)
+#    print hexEncode( swdp.read(ap = True,  register = 3) )
+#    print hexEncode( swdp.read(ap = True,  register = 3) )
+#    print hexEncode( swdp.read(ap = False, register = 3) )
 
 def hexEncode (bs):
     return ''.join(["%02X " % b for b in bytearray(bs)]).strip()
