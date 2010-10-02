@@ -1,6 +1,7 @@
 import serial
 import time
 import sys
+import array
 
 class BusPirate:
     def __init__ (self, f = "/dev/bus_pirate"):
@@ -10,6 +11,7 @@ class BusPirate:
     def reset (self):
         self.port.write(bytearray([0x0F]))
         while self.port.read(5) != "BBIO1":
+            self.port.read(9999)
             self.port.write(bytearray([0x00]))
             time.sleep(0.01)
         self.port.write(bytearray([0x05]))
@@ -17,20 +19,30 @@ class BusPirate:
             print("error initializing bus pirate")
             sys.exit(1)
         self.port.write(bytearray([0x63,0x88]))
-        self.port.read(9999)
+        self.expected = 9999
+        self.clear()
+
+    # this is the fastest port-clearing scheme I could devise
+    def clear (self, more = 0):
+        vals = self.port.read(self.expected + more)
+        self.expected = 0
+        return vals[-more:]
 
     def readBits (self, count):
         self.port.write(bytearray([0x07] * count))
-        return [ord(self.port.read(1)) for x in range(count)]
+        return [ord(x) for x in self.clear(count)]
+
+    def skipBits (self, count):
+        self.port.write(bytearray([0x07] * count))
+        self.expected = self.expected + count
 
     def readBytes (self, count):
         self.port.write(bytearray([0x06] * count))
-        return [ord(self.port.read(1)) for x in range(count)]
+        return [ord(x) for x in self.clear(count)]
 
     def sendBytes (self, data):
-        for byte in data:
-            self.port.write(bytearray([0x10,byte]))
-            self.port.read(2)
+        self.port.write(bytearray([0x10 + ((len(data) - 1) & 0x0F)] + data))
+        self.expected = self.expected + 1 + len(data)
 
 def bitCount(int_type):
     count = 0
@@ -82,31 +94,33 @@ class SWD:
         if sum([bitCount(x) for x in data[0:4]]) % 2 != extra[0]:
             print("parity error")
         # required miniminum idle clocking is 8 bits
-        self.port.sendBytes(bytearray([0x00]))
+        self.port.sendBytes([0x00])
         # finally return the data
         return (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3]
 
-    def write (self, ap, register, data):
+    def write (self, ap, register, data, ignore = False):
         # transmit the opcode
         self.port.sendBytes([calcOpcode(ap, register, False)])
         # check the response
-        ack = self.port.readBits(5)
-        if ack[0:3] != [1,0,0]:
-            print("error in SWD stream")
-            print(ack[0:3])
-            sys.exit(1)
-        # output the data
-        payload = [0x00, 0x00, 0x00, 0x00]
+        if ignore:
+            self.port.skipBits(5)
+        else:
+            ack = self.port.readBits(5)
+            if ack[0:3] != [1,0,0]:
+                print("error in SWD stream")
+                print(ack[0:3])
+                sys.exit(1)
+        # mangle the data properly
+        payload = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
         payload[0] = reverseBits((data >>  0) & 0xFF)
         payload[1] = reverseBits((data >>  8) & 0xFF)
         payload[2] = reverseBits((data >> 16) & 0xFF)
         payload[3] = reverseBits((data >> 24) & 0xFF)
+        # set the parity bit
+        if sum([bitCount(x) for x in payload[0:4]]) % 2:
+            payload[4] = 0x80
+        # output data, parity bit, and idle clocking
         self.port.sendBytes(payload)
-        # output the parity bit and idle clocking
-        if sum([bitCount(x) for x in payload]) % 2:
-            self.port.sendBytes([0x80, 0x00])
-        else:
-            self.port.sendBytes([0x00, 0x00])
 
 class DebugPort:
     def __init__ (self, swd):
@@ -165,68 +179,134 @@ class DebugPort:
             self.curBank = adrBank
         return self.swd.read(True, adrReg)
 
-    def writeAP (self, apsel, address, data):
+    def writeAP (self, apsel, address, data, ignore = False):
         adrBank = (address >> 4) & 0xF
         adrReg  = (address >> 2) & 0x3
         if apsel != self.curAP or adrBank != self.curBank:
             self.select(apsel, adrBank)
             self.curAP = apsel
             self.curBank = adrBank
-        self.swd.write(True, adrReg, data)
+        self.swd.write(True, adrReg, data, ignore)
+
+class AHB_AP:
+    def __init__ (self, dp, apsel):
+        self.dp = dp
+        self.apsel = apsel
+        self.csw(1,2) # 32-bit auto-incrementing addressing
+
+    def csw (self, addrInc, size):
+        print "  Setting CSW"
+        self.dp.readAP(self.apsel, 0x00)
+        csw = self.dp.readRB() & 0xFFFFFF00
+        self.dp.writeAP(self.apsel, 0x00, csw + (addrInc << 4) + size)
+
+    def idcode (self):
+        self.dp.readAP(self.apsel, 0xFC)
+        return self.dp.readRB()
+
+    def readWord (self, adr):
+        self.dp.writeAP(self.apsel, 0x04, adr)
+        self.dp.readAP(self.apsel, 0x0C)
+        return self.dp.readRB()
+
+    def writeWord (self, adr, data):
+        self.dp.writeAP(self.apsel, 0x04, adr)
+        self.dp.writeAP(self.apsel, 0x0C, data)
+        return self.dp.readRB()
+
+    def readBlock (self, adr, count):
+        self.dp.writeAP(self.apsel, 0x04, adr)
+        vals = [self.dp.readAP(self.apsel, 0x0C) for off in range(count)]
+        vals.append(self.dp.readRB())
+        return vals[1:]
+
+    def writeBlock (self, adr, data):
+        self.dp.writeAP(self.apsel, 0x04, adr)
+        for val in data:
+            self.dp.writeAP(self.apsel, 0x0C, val)
+
+    def writeHalfs (self, adr, data):
+        self.csw(2, 1) # 16-bit packed-incrementing addressing
+        print "  Writing TAR"
+        self.dp.writeAP(self.apsel, 0x04, adr)
+        print "  Writing to DRW"
+        for val in data:
+            time.sleep(0.001)
+            self.dp.writeAP(self.apsel, 0x0C, val, ignore = True)
+        self.csw(1, 2) # 32-bit auto-incrementing addressing
+
+class STM32:
+    def __init__ (self, debugPort):
+        self.ahb = AHB_AP(debugPort, 0)
+
+    def halt (self):
+        # halt the processor core
+        self.ahb.writeWord(0xE000EDF0, 0xA05F0003)
+
+    def unhalt (self):
+        # unhalt the processor core
+        self.ahb.writeWord(0xE000EDF0, 0xA05F0000)
+
+    def sysReset (self):
+        # restart the processor and peripherals
+        self.ahb.writeWord(0xE000ED0C, 0x05FA0004)
+
+    def flashUnlock (self):
+        # unlock main flash
+        self.ahb.writeWord(0x40022004, 0x45670123)
+        self.ahb.writeWord(0x40022004, 0xCDEF89AB)
+
+    def flashErase (self):
+        # start the mass erase
+        self.ahb.writeWord(0x40022010, 0x00000204)
+        self.ahb.writeWord(0x40022010, 0x00000244)
+        # check the BSY flag
+        while (self.ahb.readWord(0x4002200C) & 1) == 1:
+            print "waiting for erase completion..."
+            time.sleep(0.01)
+        self.ahb.writeWord(0x40022010, 0x00000200)
+
+    def flashProgram (self):
+        self.ahb.writeWord(0x40022010, 0x00000201)
+
+    def flashProgramEnd (self):
+        self.ahb.writeWord(0x40022010, 0x00000200)
+
+def endianSwap (x):
+    a = ((x & 0xFF00FF00) >>  8) | ((x & 0x00FF00FF) <<  8)
+    b = ((a & 0xFFFF0000) >> 16) | ((a & 0x0000FFFF) << 16)
+    return b
+
+def loadFile(path):
+    arr = array.array('L')
+    try:
+        arr.fromfile(open(sys.argv[1], 'rb'), 1024*1024)
+    except EOFError:
+        pass
+    return [endianSwap(x) for x in arr.tolist()]
 
 def main():
     busPirate = BusPirate("/dev/ttyUSB0")
     debugPort = DebugPort(SWD(busPirate))
+    stm32     = STM32(debugPort)
 
-    print hex( debugPort.idcode() )
+    print "DP.IDCODE: %08X" % debugPort.idcode()
+    print "AP.IDCODE: %08X" % stm32.ahb.idcode()
+    print ""
+    print "Loading File: '%s'" % sys.argv[1]
+    vals = loadFile(sys.argv[1])
 
-    debugPort.readAP(0, 0xFC)
-    print hex( debugPort.readRB() )
-
-    debugPort.readAP(0, 0x00)
-    csw = debugPort.readRB()
-    debugPort.writeAP(0, 0x00, csw | 0x12)
-    debugPort.readAP(0, 0x00)
-    print hex( csw                )
-    print hex( debugPort.readRB() )
-
-    debugPort.writeAP(0, 0x04, 0xE0042000)
-    debugPort.readAP(0,0x0C)
-    print hex(debugPort.readRB())
-
-    debugPort.writeAP(0, 0x04, 0x08000000)
-    for off in range(1024):
-        debugPort.readAP(0,0x04)
-        adr = debugPort.readRB()
-        debugPort.readAP(0,0x0C)
-        val = debugPort.readRB()
-        print "%08X: %08X" % (adr, val)
-
-#    debugPort.readAP(0, 0x00)
-#    debugPort.writeAP(0, 0x04, 0x12345678)
-#    print hex( debugPort.readAP(0, 0x04) )
-#    print hex( debugPort.readAP(0, 0x08) )
-#    print hex( debugPort.readAP(0, 0x04) )
-#    print hex( debugPort.readRB() )
-
-#    rID     = 0
-#    rMulti  = 1
-#    rSelect = 2
-#
-#    # try to write to AP.TAP
-#    swdp.write([0x00, 0x00, 0x00, 0x00], ap = False, register = rSelect)
-#    swdp.write([0x12, 0x23, 0x34, 0x45], ap = True,  register = 1)
-#    print hexEncode( swdp.read(ap = True,  register = 1) )
-#    print hexEncode( swdp.read(ap = False, register = 3) )
-#
-#    # try to read AP zero IDR
-#    swdp.write([0x00, 0x00, 0x00, 0xF0], ap = False, register = 2)
-#    print hexEncode( swdp.read(ap = True,  register = 3) )
-#    print hexEncode( swdp.read(ap = True,  register = 3) )
-#    print hexEncode( swdp.read(ap = False, register = 3) )
-
-def hexEncode (bs):
-    return ''.join(["%02X " % b for b in bytearray(bs)]).strip()
+    print "Halting Processor"
+    stm32.halt()
+    print "Erasing Flash"
+    stm32.flashUnlock()
+    stm32.flashErase()
+    print "Programming Flash"
+    stm32.flashProgram()
+    stm32.ahb.writeHalfs(0x08000000, vals)
+    stm32.flashProgramEnd()
+    print "Resetting"
+    stm32.sysReset()
 
 if __name__ == "__main__":
     main()
