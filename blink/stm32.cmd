@@ -22,8 +22,8 @@ SEARCH_DIR(.)*/
 
 MEMORY
 {
-  ram (rwx) : ORIGIN = 0x20000000, LENGTH = 4K
-  rom (rx) : ORIGIN = 0x00000000, LENGTH = 16K
+  ram (rwx) : ORIGIN = 0x20000000, LENGTH =  8K
+  rom (rx) : ORIGIN = 0x00000000, LENGTH = 128K
 }
 SECTIONS
   {

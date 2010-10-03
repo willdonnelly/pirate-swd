@@ -272,18 +272,13 @@ class STM32:
     def flashProgramEnd (self):
         self.ahb.writeWord(0x40022010, 0x00000200)
 
-def endianSwap (x):
-    a = ((x & 0xFF00FF00) >>  8) | ((x & 0x00FF00FF) <<  8)
-    b = ((a & 0xFFFF0000) >> 16) | ((a & 0x0000FFFF) << 16)
-    return b
-
 def loadFile(path):
     arr = array.array('L')
     try:
         arr.fromfile(open(sys.argv[1], 'rb'), 1024*1024)
     except EOFError:
         pass
-    return [endianSwap(x) for x in arr.tolist()]
+    return arr.tolist()
 
 def main():
     busPirate = BusPirate("/dev/ttyUSB0")
