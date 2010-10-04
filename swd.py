@@ -3,6 +3,16 @@ import time
 import sys
 import array
 
+class SWDProtocolError(Exception):
+    "The target responded with an invalid ACK"
+    pass
+class SWDFaultError(Exception):
+    "The target responded with a 'fault' ACK"
+    pass
+class SWDWaitError(Exception):
+    "The target responded with a 'wait' ACK"
+    pass
+
 class BusPirate:
     def __init__ (self, f = "/dev/bus_pirate"):
         self.port = serial.Serial(port = f, baudrate = 115200, timeout = 0.01)
