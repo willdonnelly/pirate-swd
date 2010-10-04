@@ -3,6 +3,12 @@ import time
 import sys
 import array
 
+#
+# Exception Classes
+#
+class SWDInitError(Exception):
+    "There was an error initializing SWD communications"
+    pass
 class SWDProtocolError(Exception):
     "The target responded with an invalid ACK"
     pass
@@ -12,25 +18,69 @@ class SWDFaultError(Exception):
 class SWDWaitError(Exception):
     "The target responded with a 'wait' ACK"
     pass
+class SWDParityError(Exception):
+    "The target sent data with incorrect parity"
+    pass
 
-class BusPirate:
+#
+# Helper Functions
+#
+
+def bitCount(int_type):
+    count = 0
+    while(int_type):
+        int_type &= int_type - 1
+        count += 1
+    return(count)
+
+def reverseBits (x):
+    a = ((x & 0xAA) >> 1) | ((x & 0x55) << 1)
+    b = ((a & 0xCC) >> 2) | ((a & 0x33) << 2)
+    c = ((b & 0xF0) >> 4) | ((b & 0x0F) << 4)
+    return c
+
+def calcOpcode (ap, register, read):
+    opcode = 0x00
+    opcode = opcode | (0x20 if read else 0x00)
+    opcode = opcode | (0x40 if ap else 0x00)
+    opcode = opcode | ((register & 0x01) << 4) | ((register & 0x02) << 2)
+    opcode = opcode | ((bitCount(opcode) & 1) << 2)
+    opcode = opcode | 0x81
+    return opcode
+
+def loadFile(path):
+    arr = array.array('L')
+    try:
+        arr.fromfile(open(sys.argv[1], 'rb'), 1024*1024)
+    except EOFError:
+        pass
+    return arr.tolist()
+
+#
+# Bus Pirate SWD Interface
+#
+
+class PirateSWD:
     def __init__ (self, f = "/dev/bus_pirate"):
         self.port = serial.Serial(port = f, baudrate = 115200, timeout = 0.01)
-        self.reset()
+        self.resetBP()
+        self.sendBytes([0xFF] * 8)
+        self.sendBytes([0x79, 0xE7])
+        self.resyncSWD()
 
-    def reset (self):
+    def resetBP (self):
+        self.expected = 9999
+        self.clear()
         self.port.write(bytearray([0x0F]))
         while self.port.read(5) != "BBIO1":
-            self.port.read(9999)
+            self.clear(9999)
             self.port.write(bytearray([0x00]))
             time.sleep(0.01)
         self.port.write(bytearray([0x05]))
         if self.port.read(4) != "RAW1":
-            print("error initializing bus pirate")
-            sys.exit(1)
+            raise SWDInitError("error initializing bus pirate")
         self.port.write(bytearray([0x63,0x88]))
-        self.expected = 9999
-        self.clear()
+        self.clear(9999)
 
     # this is the fastest port-clearing scheme I could devise
     def clear (self, more = 0):
@@ -54,83 +104,61 @@ class BusPirate:
         self.port.write(bytearray([0x10 + ((len(data) - 1) & 0x0F)] + data))
         self.expected = self.expected + 1 + len(data)
 
-def bitCount(int_type):
-    count = 0
-    while(int_type):
-        int_type &= int_type - 1
-        count += 1
-    return(count)
+    def resyncSWD (self):
+        self.sendBytes([0xFF] * 8)
+        self.sendBytes([0x00] * 8)
 
-def reverseBits (x):
-    a = ((x & 0xAA) >> 1) | ((x & 0x55) << 1)
-    b = ((a & 0xCC) >> 2) | ((a & 0x33) << 2)
-    c = ((b & 0xF0) >> 4) | ((b & 0x0F) << 4)
-    return c
-
-def calcOpcode (ap=False, register=0x00, read=True):
-    opcode = 0x00
-    opcode = opcode | (0x20 if read else 0x00)
-    opcode = opcode | (0x40 if ap else 0x00)
-    opcode = opcode | ((register & 0x01) << 4) | ((register & 0x02) << 2)
-    opcode = opcode | ((bitCount(opcode) & 1) << 2)
-    opcode = opcode | 0x81
-    return opcode
-
-class SWD:
-    def __init__ (self, port):
-        self.port = port
-        self.port.sendBytes([0xFF] * 8)
-        self.port.sendBytes([0x79, 0xE7])
-        self.resync()
-
-    def resync (self):
-        self.port.sendBytes([0xFF] * 8)
-        self.port.sendBytes([0x00] * 8)
-
-    def read (self, ap, register):
+    def readSWD (self, ap, register):
         # transmit the opcode
-        self.port.sendBytes([calcOpcode(ap, register, True)])
+        self.sendBytes([calcOpcode(ap, register, True)])
         # check the response
-        ack = self.port.readBits(3)
+        ack = self.readBits(3)
         if ack[0:3] != [1,0,0]:
-            print("error in SWD stream")
-            print(ack[0:3])
-            sys.exit(1)
+            if   ack[0:3] == [0,1,0]:
+                raise SWDWaitError(ack[0:3])
+            elif ack[0:3] == [0,0,1]:
+                raise SWDFaultError(ack[0:3])
+            else:
+                raise SWDProtocolError(ack[0:3])
         # read the next 4 bytes
-        data = [reverseBits(b) for b in self.port.readBytes(4)]
+        data = [reverseBits(b) for b in self.readBytes(4)]
         data.reverse()
-        extra = self.port.readBits(3)
+        # read the parity bit and turnaround period
+        extra = self.readBits(3)
         # check the parity
         if sum([bitCount(x) for x in data[0:4]]) % 2 != extra[0]:
-            print("parity error")
-        # required miniminum idle clocking is 8 bits
-        self.port.sendBytes([0x00])
-        # finally return the data
+            raise SWDParityError()
+        # idle clocking to allow transactions to complete
+        self.sendBytes([0x00])
+        # return the data
         return (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3]
 
-    def write (self, ap, register, data, ignore = False):
+    def writeSWD (self, ap, register, data, ignoreACK = False):
         # transmit the opcode
-        self.port.sendBytes([calcOpcode(ap, register, False)])
-        # check the response
-        if ignore:
-            self.port.skipBits(5)
+        self.sendBytes([calcOpcode(ap, register, False)])
+        # check the response if required
+        if ignoreACK:
+            self.skipBits(5)
         else:
-            ack = self.port.readBits(5)
+            ack = self.readBits(5)
             if ack[0:3] != [1,0,0]:
-                print("error in SWD stream")
-                print(ack[0:3])
-                sys.exit(1)
-        # mangle the data properly
+                if   ack[0:3] == [0,1,0]:
+                    raise SWDWaitError(ack[0:3])
+                elif ack[0:3] == [0,0,1]:
+                    raise SWDFaultError(ack[0:3])
+                else:
+                    raise SWDProtocolError(ack[0:3])
+        # mangle the data endianness
         payload = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
         payload[0] = reverseBits((data >>  0) & 0xFF)
         payload[1] = reverseBits((data >>  8) & 0xFF)
         payload[2] = reverseBits((data >> 16) & 0xFF)
         payload[3] = reverseBits((data >> 24) & 0xFF)
-        # set the parity bit
+        # add the parity bit
         if sum([bitCount(x) for x in payload[0:4]]) % 2:
             payload[4] = 0x80
-        # output data, parity bit, and idle clocking
-        self.port.sendBytes(payload)
+        # output the data, idle clocking is on the end of the payload
+        self.sendBytes(payload)
 
 class DebugPort:
     def __init__ (self, swd):
@@ -139,7 +167,7 @@ class DebugPort:
         if self.idcode() != 0x1BA01477:
             print "warning: unexpected idcode"
         # power shit up
-        self.swd.write(False, 1, 0x54000000)
+        self.swd.writeSWD(False, 1, 0x54000000)
         if (self.status() >> 24) != 0xF4:
             print "error powering up system"
             sys.exit(1)
@@ -149,7 +177,7 @@ class DebugPort:
         self.curBank = 0
 
     def idcode (self):
-        return self.swd.read(False, 0)
+        return self.swd.readSWD(False, 0)
 
     def abort (self, orunerr, wdataerr, stickyerr, stickycmp, dap):
         value = 0x00000000
@@ -158,10 +186,10 @@ class DebugPort:
         value = value | (0x04 if stickyerr else 0x00)
         value = value | (0x02 if stickycmp else 0x00)
         value = value | (0x01 if dap else 0x00)
-        self.swd.write(False, 0, value)
+        self.swd.writeSWD(False, 0, value)
 
     def status (self):
-        return self.swd.read(False, 1)
+        return self.swd.readSWD(False, 1)
 
     def control (self, trnCount = 0, trnMode = 0, maskLane = 0, orunDetect = 0):
         value = 0x54000000
@@ -169,16 +197,16 @@ class DebugPort:
         value = value | ((maskLane & 0x00F) << 8)
         value = value | ((trnMode  & 0x003) << 2)
         value = value | (0x1 if orunDetect else 0x0)
-        self.swd.write(False, 1, value)
+        self.swd.writeSWD(False, 1, value)
 
     def select (self, apsel, apbank):
         value = 0x00000000
         value = value | ((apsel  & 0xFF) << 24)
         value = value | ((apbank & 0x0F) <<  4)
-        self.swd.write(False, 2, value)
+        self.swd.writeSWD(False, 2, value)
 
     def readRB (self):
-        return self.swd.read(False, 3)
+        return self.swd.readSWD(False, 3)
 
     def readAP (self, apsel, address):
         adrBank = (address >> 4) & 0xF
@@ -187,7 +215,7 @@ class DebugPort:
             self.select(apsel, adrBank)
             self.curAP = apsel
             self.curBank = adrBank
-        return self.swd.read(True, adrReg)
+        return self.swd.readSWD(True, adrReg)
 
     def writeAP (self, apsel, address, data, ignore = False):
         adrBank = (address >> 4) & 0xF
@@ -196,7 +224,7 @@ class DebugPort:
             self.select(apsel, adrBank)
             self.curAP = apsel
             self.curBank = adrBank
-        self.swd.write(True, adrReg, data, ignore)
+        self.swd.writeSWD(True, adrReg, data, ignore)
 
 class AHB_AP:
     def __init__ (self, dp, apsel):
@@ -282,17 +310,9 @@ class STM32:
     def flashProgramEnd (self):
         self.ahb.writeWord(0x40022010, 0x00000200)
 
-def loadFile(path):
-    arr = array.array('L')
-    try:
-        arr.fromfile(open(sys.argv[1], 'rb'), 1024*1024)
-    except EOFError:
-        pass
-    return arr.tolist()
-
 def main():
-    busPirate = BusPirate("/dev/ttyUSB0")
-    debugPort = DebugPort(SWD(busPirate))
+    busPirate = PirateSWD("/dev/ttyUSB0")
+    debugPort = DebugPort(busPirate)
     stm32     = STM32(debugPort)
 
     print "DP.IDCODE: %08X" % debugPort.idcode()
