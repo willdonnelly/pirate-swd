@@ -2,8 +2,8 @@
 .PHONY: clean
 
 CHIP    = STM32F10X_LD_VL
-NAME    = gpio
-FILES   = gpio.c
+NAME    = blink
+FILES   = blink.c
 
 CC      = arm-none-eabi-gcc
 LD      = arm-none-eabi-ld
